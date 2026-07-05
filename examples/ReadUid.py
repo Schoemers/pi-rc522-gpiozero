@@ -16,7 +16,7 @@ if __name__ == '__main__':
     logger.info(GPIO.RPI_INFO)
 
     try:
-        reader = pirc522.RFID(pin_mode='BOARD', pin_rst=PIN_RST, pin_irq=PIN_IRQ, antenna_gain=4)
+        reader = pirc522.RFID(pin_mode='BOARD', pin_rst=PIN_RST, pin_irq=PIN_IRQ)
         while True:
             reader.wait_for_tag()
             uid = reader.read_id(True)
