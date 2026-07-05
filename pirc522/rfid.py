@@ -24,6 +24,10 @@ def_pin_irq = 18
 def_pin_mode = 'BOARD_DEFAULT'
 
 
+def timed_out(start_time, timeout) -> bool:
+    return timeout == 0 or ((time.time() - start_time) < timeout)
+
+
 class RFID(object):
     pin_rst = 22
     pin_ce = 0
@@ -46,10 +50,10 @@ class RFID(object):
     addr_RFCfgReg = 0x26
     addr_TModeReg = 0x2A
     addr_TPrescalerReg = 0x2B
-    addr_TReloadReg2C = 0x2C
-    addr_TReloadReg2D = 0x2D
-    addr_CRCResultReg21 = 0x21
-    addr_CRCResultReg22 = 0x22
+    addr_TReloadRegHI = 0x2C
+    addr_TReloadRegLO = 0x2D
+    addr_CRCResultRegHI = 0x21
+    addr_CRCResultRegLO = 0x22
 
     bit_Tx1RFEn = 1 << 0
     bit_Tx2RFEn = 1 << 1
@@ -159,8 +163,8 @@ class RFID(object):
         self.disable_interrupts()
         self.dev_write(self.addr_TModeReg, 0x8D)
         self.dev_write(self.addr_TPrescalerReg, 0x3E)
-        self.dev_write(self.addr_TReloadReg2D, 30)
-        self.dev_write(self.addr_TReloadReg2C, 0)
+        self.dev_write(self.addr_TReloadRegLO, 30)
+        self.dev_write(self.addr_TReloadRegHI, 0)
         self.dev_write(self.addr_TxASKReg, 0x40)
         self.dev_write(self.addr_ModeReg, 0x3D)
         self.set_antenna_gain(self.antenna_gain)
@@ -175,10 +179,12 @@ class RFID(object):
         return r
 
     def dev_write(self, address, value):
-        self.spi_transfer([(address << 1) & 0x7E, value])
+        _address = (address << 1) & 0x7E
+        self.spi_transfer([_address, value])
 
     def dev_read(self, address):
-        return self.spi_transfer([((address << 1) & 0x7E) | 0x80, 0])[1]
+        _address = ((address << 1) & 0x7E) | 0x80
+        return self.spi_transfer([_address, 0])[1]
 
     def set_bitmask(self, address, mask):
         current = self.dev_read(address)
@@ -190,7 +196,7 @@ class RFID(object):
 
     def set_antenna(self, state):
         val = self.bit_Tx1RFEn | self.bit_Tx2RFEn
-        if state == True:
+        if state:
             current = self.dev_read(self.addr_TxControlReg)
             if ~(current & val):
                 self.set_bitmask(self.addr_TxControlReg, val)
@@ -203,7 +209,7 @@ class RFID(object):
         """
         if 0 <= gain <= 7:
             self.antenna_gain = gain
-            self.dev_write(self.addr_RFCfgReg, (self.antenna_gain<<4))
+            self.dev_write(self.addr_RFCfgReg, (self.antenna_gain << 4))
         else:
             raise ValueError('Antenna gain has to be in the range 0...7')
 
@@ -213,8 +219,6 @@ class RFID(object):
         error = False
         irq = 0x00
         irq_wait = 0x00
-        last_bits = None
-        n = 0
 
         if command == self.mode_auth:
             irq = 0x12
@@ -228,8 +232,8 @@ class RFID(object):
         self.set_bitmask(self.addr_FIFOLevelReg, 0x80)
         self.dev_write(self.addr_CommandReg, self.mode_idle)
 
-        for i in range(len(data)):
-            self.dev_write(self.addr_FIFODataReg, data[i])
+        for value in data:
+            self.dev_write(self.addr_FIFODataReg, value)
 
         self.dev_write(self.addr_CommandReg, command)
 
@@ -273,9 +277,9 @@ class RFID(object):
                 logger.warning("Error E2")
                 error = True
 
-        return (error, back_data, back_length)
+        return error, back_data, back_length
 
-    def read_id(self, as_number = False):
+    def read_id(self, as_number=False):
         """
         Obtains the id (4 or 7 bytes) of a tag (if present)
         Return None on error or not present, otherwise returns tag ID
@@ -319,91 +323,73 @@ class RFID(object):
         Requests for tag.
         Returns (False, None) if no tag is present, otherwise returns (True, tag type)
         """
-        error = True
-        back_bits = 0
 
         self.dev_write(self.addr_BitFramingReg, 0x07)
         (error, back_data, back_bits) = self.card_write(self.mode_transrec, [req_mode, ])
+        logger.debug("error: {0}, back_data: {1}, back_bits: {2}", error, back_data, back_bits)
 
         if error or (back_bits != 0x10):
-            return (True, None)
+            return True, None
 
-        return (False, back_bits)
+        return False, back_bits
+
+    def crcCheck(self, back_data) -> bool:
+        if len(back_data) != 5:
+            return False
+        crc_sum = 0
+        # xor the first four bytes
+        for value in back_data[:4]:
+            crc_sum = crc_sum ^ value
+
+        # should be the same as the fifth byte
+        return crc_sum != back_data[4]
 
     def anticoll(self):
         """
         Anti-collision detection.
         Returns tuple of (error state, tag ID).
         """
-        back_data = []
-        serial_number = []
 
-        serial_number_check = 0
-
-        self.dev_write(self.addr_BitFramingReg, 0x00)
-        serial_number.append(self.act_anticl)
-        serial_number.append(0x20)
-
-        (error, back_data, back_bits) = self.card_write(self.mode_transrec, serial_number)
-        if not error:
-            if len(back_data) == 5:
-                for i in range(4):
-                    serial_number_check = serial_number_check ^ back_data[i]
-
-                if serial_number_check != back_data[4]:
-                    error = True
-            else:
-                error = True
-
-        return (error, back_data)
+        return self.__anticoll_internal(self.act_anticl)
 
     def anticoll2(self):
         """
         Anti-collision detection.
         Returns tuple of (error state, tag ID).
         """
-        back_data = []
-        serial_number = []
 
-        serial_number_check = 0
+        return self.__anticoll_internal(self.act_anticl2)
+
+    def __anticoll_internal(self, type):
+        """
+        Anti-collision detection.
+        Returns tuple of (error state, tag ID).
+        """
 
         self.dev_write(self.addr_BitFramingReg, 0x00)
-        serial_number.append(self.act_anticl2)
-        serial_number.append(0x20)
+        (error, back_data, back_bits) = self.card_write(self.mode_transrec, [type, 0x20])
 
-        (error, back_data, back_bits) = self.card_write(self.mode_transrec, serial_number)
         if not error:
-            if len(back_data) == 5:
-                for i in range(4):
-                    serial_number_check = serial_number_check ^ back_data[i]
+            error = not self.crcCheck(back_data)
 
-                if serial_number_check != back_data[4]:
-                    error = True
-            else:
-                error = True
-
-        return (error, back_data)
+        return error, back_data
 
     def calculate_crc(self, data):
         self.clear_bitmask(self.addr_DivIrqReg, 0x04)
         self.set_bitmask(self.addr_FIFOLevelReg, 0x80)
 
-        for i in range(len(data)):
-            self.dev_write(self.addr_FIFODataReg, data[i])
+        for value in data:
+            self.dev_write(self.addr_FIFODataReg, value)
         self.dev_write(self.addr_CommandReg, self.mode_crc)
 
         i = 255
         while True:
             n = self.dev_read(self.addr_DivIrqReg)
             i -= 1
-            if not ((i != 0) and not (n & 0x04)):
+            if not (i != 0) or (n & 0x04):
                 break
 
-        ret_data = []
-        ret_data.append(self.dev_read(self.addr_CRCResultReg22))
-        ret_data.append(self.dev_read(self.addr_CRCResultReg21))
-
-        return ret_data
+        return [self.dev_read(self.addr_CRCResultRegLO), self.dev_read(self.addr_CRCResultRegHI)]
 
     def select_tag(self, uid):
         """
@@ -411,25 +397,14 @@ class RFID(object):
         uid -- list or tuple with four bytes tag ID
         Returns error state.
         """
-        back_data = []
-        buf = []
 
-        buf.append(self.act_select)
-        buf.append(0x70)
+        buffer = [self.act_select, 0x70]
+        buffer.extend(uid)
+        self.appendCRC(buffer)
 
-        for i in range(5):
-            buf.append(uid[i])
+        (error, back_data, back_length) = self.card_write(self.mode_transrec, buffer)
 
-        crc = self.calculate_crc(buf)
-        buf.append(crc[0])
-        buf.append(crc[1])
-
-        (error, back_data, back_length) = self.card_write(self.mode_transrec, buf)
-
-        if (not error) and (back_length == 0x18):
-            return False
-        else:
-            return True
+        return error or back_length != 0x18
 
     def card_auth(self, auth_mode, block_address, key, uid):
         """
@@ -439,17 +414,11 @@ class RFID(object):
         uid -- list or tuple with four bytes tag ID
         Returns error state.
         """
-        buf = []
-        buf.append(auth_mode)
-        buf.append(block_address)
+        buffer = [auth_mode, block_address]
+        buffer.extend(key)
+        buffer.extend(uid[:4])
 
-        for i in range(len(key)):
-            buf.append(key[i])
-
-        for i in range(4):
-            buf.append(uid[i])
-
-        (error, back_data, back_length) = self.card_write(self.mode_auth, buf)
+        (error, back_data, back_length) = self.card_write(self.mode_auth, buffer)
         if not (self.dev_read(self.addr_Status2Reg) & 0x08) != 0:
             error = True
 
@@ -466,11 +435,8 @@ class RFID(object):
     def halt(self):
         """Switch state to HALT"""
 
-        buf = []
-        buf.append(self.act_end)
-        buf.append(0)
+        buf = [self.act_end, 0]
 
-        crc = self.calculate_crc(buf)
         self.clear_bitmask(self.addr_Status2Reg, 0x80)
         self.card_write(self.mode_transrec, buf)
         self.clear_bitmask(self.addr_Status2Reg, 0x08)
@@ -481,47 +447,40 @@ class RFID(object):
         Reads data from block. You should be authenticated before calling read.
         Returns tuple of (error state, read data).
         """
-        buf = []
-        buf.append(self.act_read)
-        buf.append(block_address)
-        crc = self.calculate_crc(buf)
-        buf.append(crc[0])
-        buf.append(crc[1])
-        (error, back_data, back_length) = self.card_write(self.mode_transrec, buf)
+        buffer = [self.act_read, block_address]
+        self.appendCRC(buffer)
+
+        (error, back_data, back_length) = self.card_write(self.mode_transrec, buffer)
 
         if len(back_data) != 16:
             error = True
 
-        return (error, back_data)
+        return error, back_data
 
     def write(self, block_address, data):
         """
         Writes data to block. You should be authenticated before calling write.
         Returns error state.
         """
-        buf = []
-        buf.append(self.act_write)
-        buf.append(block_address)
-        crc = self.calculate_crc(buf)
-        buf.append(crc[0])
-        buf.append(crc[1])
-        (error, back_data, back_length) = self.card_write(self.mode_transrec, buf)
-        if not(back_length == 4) or not((back_data[0] & 0x0F) == 0x0A):
+        buffer = [self.act_write, block_address]
+        self.appendCRC(buffer)
+
+        (error, back_data, back_length) = self.card_write(self.mode_transrec, buffer)
+        if back_length != 4 or (back_data[0] & 0x0F) != 0x0A:
             error = True
 
         if not error:
-            buf_w = []
-            for i in range(16):
-                buf_w.append(data[i])
-
-            crc = self.calculate_crc(buf_w)
-            buf_w.append(crc[0])
-            buf_w.append(crc[1])
-            (error, back_data, back_length) = self.card_write(self.mode_transrec, buf_w)
-            if not(back_length == 4) or not((back_data[0] & 0x0F) == 0x0A):
+            buffer = []
+            buffer.extend(data[:16])
+            self.appendCRC(buffer)
+            (error, back_data, back_length) = self.card_write(self.mode_transrec, buffer)
+            if back_length != 4 or (back_data[0] & 0x0F) != 0x0A:
                 error = True
 
         return error
+
+    def appendCRC(self, buffer):
+        buffer.extend(self.calculate_crc(buffer))
 
     def irq_callback(self):
         logger.debug("irq_callback")
@@ -532,14 +491,12 @@ class RFID(object):
             raise NotImplementedError('Waiting not implemented if IRQ is not used')
         logger.debug(f'wait_for_tag(timeout={timeout})')
         # enable IRQ on detect
-        self.init()
         self.irq.clear()
-        self.dev_write(self.addr_ComIrqReq, 0x00)
-        self.dev_write(self.addr_ComIEnReg, 0xA0)
-        # wait for it
         start_time = time.time()
         waiting = True
-        while waiting and (timeout == 0 or ((time.time() - start_time) < timeout)):
+
+        # wait for irq
+        while waiting and (timed_out(start_time, timeout)):
             self.init()
             self.dev_write(self.addr_ComIrqReq, 0x00)
             self.dev_write(self.addr_ComIEnReg, 0xA0)
@@ -554,7 +511,7 @@ class RFID(object):
         self.init()
 
     def reset(self):
-        authed = False
+        self.authed = False
         self.dev_write(self.addr_CommandReg, self.mode_reset)
 
     def cleanup(self):
